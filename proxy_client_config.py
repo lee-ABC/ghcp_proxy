@@ -53,6 +53,7 @@ def _model_token_pricing_description(model_name: str) -> str:
         "gpt-5.6-luna-excel",
         "gpt-5.6-terra-excel",
         "gpt-5.6-sol-excel",
+        "gpt-6-excel",
     }:
         return "ChatGPT subscription usage; not API-token billing"
     pricing = MODEL_PRICING.get(model_name)
@@ -1191,6 +1192,7 @@ class ProxyClientConfigService:
     ) -> list[str]:
         family_order = {"gpt": 0, "claude": 1, "gemini": 2, "grok": 3}
         preferred_order = {
+            "gpt-6-excel": -28,
             "gpt-6-astra-excel": -27,
             "gpt-5.6-sol-excel": -26,
             "gpt-5.6-terra-excel": -25,

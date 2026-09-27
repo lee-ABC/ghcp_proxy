@@ -1,5 +1,6 @@
 import unittest
 
+from constants import MODEL_PRICING
 from dashboard import _prepare_usage_event
 from util import _usage_event_model_name
 
@@ -23,6 +24,26 @@ class UsageModelIdentityTests(unittest.TestCase):
             with self.subTest(excel_model=excel_model):
                 self.assertEqual(_usage_event_model_name(event), excel_model)
                 self.assertEqual(_prepare_usage_event(event)["model_name"], excel_model)
+
+    def test_gpt_6_excel_preserves_alias_and_existing_base_rates(self):
+        event = {
+            "requested_model": "gpt-6-excel",
+            "resolved_model": "gpt-6-excel",
+            "response_model": "gpt-6-sol",
+            "finished_at": "2026-09-27T18:00:00Z",
+            "usage": {"input_tokens": 1000, "output_tokens": 100},
+        }
+        self.assertEqual(_usage_event_model_name(event), "gpt-6-excel")
+        self.assertEqual(_prepare_usage_event(event)["model_name"], "gpt-6-excel")
+        rates = MODEL_PRICING["gpt-6-excel"]
+        for key, value in MODEL_PRICING["gpt-6-sol"].items():
+            if key != "provider":
+                self.assertEqual(rates[key], value)
+        self.assertEqual(rates["provider"], "OpenAI Excel")
+        self.assertEqual(
+            rates["credit_unit_usd"],
+            MODEL_PRICING["gpt-5.6-sol-excel"]["credit_unit_usd"],
+        )
 
     def test_non_credit_model_keeps_response_model_precedence(self):
         event = {

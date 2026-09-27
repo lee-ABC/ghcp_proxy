@@ -164,6 +164,7 @@ class ExcelUpstreamTests(unittest.TestCase):
             "gpt-5.6-luna-excel": "gpt-5.6-luna",
             "gpt-5.6-terra-excel": "gpt-5.6-terra",
             "gpt-5.6-sol-excel": "gpt-5.6-sol",
+            "gpt-6-excel": "gpt-6-sol",
         }
         for requested, upstream in expected.items():
             with self.subTest(requested=requested):
@@ -174,6 +175,24 @@ class ExcelUpstreamTests(unittest.TestCase):
                 self.assertEqual(body["model_selection"], "explicit")
                 self.assertTrue(excel_upstream.is_excel_model(requested))
         self.assertFalse(excel_upstream.is_excel_model("gpt-excel"))
+
+    def test_gpt_6_excel_preserves_default_and_request_contract(self):
+        self.assertEqual(excel_upstream.MODEL_ID, "gpt-5.6-sol-excel")
+        self.assertEqual(
+            excel_upstream.LOCAL_MODEL_CAPABILITIES["gpt-6-excel"]["display_name"],
+            "6-Sol Excel",
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                body = excel_upstream.prepare_responses_body({
+                    "model": "gpt-6-excel", "input": "Hello",
+                    "stream": stream, "reasoning": {"effort": "low"},
+                })
+                self.assertEqual(body["model"], "gpt-6-sol")
+                self.assertEqual(body["model_selection"], "explicit")
+                self.assertEqual(body["reasoning_effort"], "low")
+                self.assertIs(body["stream"], stream)
+                self.assertIs(body["store"], False)
 
     def test_task_identity_is_stable_for_a_conversation(self):
         source = {
@@ -1503,9 +1522,11 @@ class ExcelUpstreamTests(unittest.TestCase):
             [item["id"] for item in payload["data"]],
             [
                 "gpt-5.5",
+                "gpt-6-astra-excel",
                 "gpt-5.6-luna-excel",
                 "gpt-5.6-terra-excel",
                 "gpt-5.6-sol-excel",
+                "gpt-6-excel",
             ],
         )
 
