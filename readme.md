@@ -1,3 +1,5 @@
+> **Sub2API account pools:** See [the separate Excel bridge integration](integrations/sub2api/README.md). This does not replace the Copilot application.
+
 # GHCP Proxy
 
 GHCP Proxy provides an OpenAI-compatible local endpoint for using GitHub Copilot with Codex and the ChatGPT app. Claude Code is also supported through a compatibility integration.

@@ -1,0 +1,497 @@
+diff --git a/src/excel_codex_bridge/codex_config.py b/src/excel_codex_bridge/codex_config.py
+index f937cb1..ad47d34 100644
+--- a/src/excel_codex_bridge/codex_config.py
++++ b/src/excel_codex_bridge/codex_config.py
+@@ -38,7 +38,7 @@ You are Codex, a coding agent running in the user's terminal. You and the user s
+ - When done, reply concisely: what changed (with file paths), how it was verified, and anything left for the user. Use plain Markdown and do not paste whole files.
+ """
+ 
+-CATALOG_ORDER = ("gpt-5.6-sol-excel", "gpt-6-astra-excel", "gpt-5.6-terra-excel", "gpt-5.6-luna-excel")
++CATALOG_ORDER = ("gpt-5.6-sol-excel", "gpt-6-astra-excel", "gpt-5.6-terra-excel", "gpt-5.6-luna-excel", "gpt-6-excel")
+ 
+ _REASONING_LEVEL_DESCRIPTIONS = {
+     "low": "Fast responses with lighter reasoning",
+diff --git a/src/excel_codex_bridge/excel_upstream.py b/src/excel_codex_bridge/excel_upstream.py
+index 6443eaa..06addcf 100644
+--- a/src/excel_codex_bridge/excel_upstream.py
++++ b/src/excel_codex_bridge/excel_upstream.py
+@@ -9,6 +9,7 @@ isolated in memory and expose only non-secret status information.
+ """
+ 
+ from __future__ import annotations
++from contextvars import ContextVar
+ 
+ import base64
+ import contextlib
+@@ -36,6 +37,7 @@ EXCEL_MODEL_UPSTREAMS = {
+     "gpt-5.6-sol-excel": "gpt-5.6-sol",
+     # excel-codex-bridge: not yet confirmed on the Excel backend.
+     "gpt-6-astra-excel": "gpt-6-astra",
++    "gpt-6-excel": "gpt-6-sol",
+ }
+ MODEL_IDS = tuple(EXCEL_MODEL_UPSTREAMS)
+ MODEL_ID = "gpt-5.6-sol-excel"
+@@ -67,6 +69,7 @@ CLIENT_TOOL_TRANSPORT_ALIASES = frozenset(
+ TOOLS_VERSION_METADATA_KEY = "bps_tools_version_id"
+ _TOOLS_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+ _NATIVE_CALL_CACHE_LIMIT = 512
++native_call_scope: ContextVar[str] = ContextVar("excel_native_call_scope", default="")
+ _native_call_cache_lock = threading.Lock()
+ _native_call_cache: OrderedDict[str, dict] = OrderedDict()
+ _STORED_CALL_LIMIT = 5000
+@@ -164,6 +167,7 @@ LOCAL_MODEL_CAPABILITIES = {
+             "gpt-5.6-terra-excel": "5.6-Terra Excel",
+             "gpt-5.6-sol-excel": "5.6-Sol Excel",
+             "gpt-6-astra-excel": "6-Astra Excel",
++            "gpt-6-excel": "6-Sol Excel",
+         }.get(model_id, model_id.removesuffix("-excel").upper().replace("GPT-", "GPT ")),
+         "input_modalities": ["text", "image"],
+         "max_context_window": 200_000 if "luna" in model_id else 272_000,
+@@ -352,6 +356,7 @@ def _remember_native_call(item: dict) -> None:
+     call_id = item.get("call_id")
+     if not isinstance(call_id, str) or not call_id:
+         return
++    call_id = (native_call_scope.get() + ":" + call_id) if native_call_scope.get() else call_id
+     with _native_call_cache_lock:
+         _native_call_cache[call_id] = copy.deepcopy(item)
+         _native_call_cache.move_to_end(call_id)
+@@ -363,6 +368,7 @@ def _remember_native_call(item: dict) -> None:
+ def _remembered_native_call(call_id: object) -> dict | None:
+     if not isinstance(call_id, str) or not call_id:
+         return None
++    call_id = (native_call_scope.get() + ":" + call_id) if native_call_scope.get() else call_id
+     with _native_call_cache_lock:
+         item = _native_call_cache.get(call_id)
+         if item is not None:
+diff --git a/src/excel_codex_bridge/server.py b/src/excel_codex_bridge/server.py
+index 8dbfbd3..57ca02a 100644
+--- a/src/excel_codex_bridge/server.py
++++ b/src/excel_codex_bridge/server.py
+@@ -121,6 +121,8 @@ def _decode_body(raw: bytes, content_encoding: str) -> dict:
+ 
+ def _canonical_model(model: object) -> str | None:
+     """Accept the Excel aliases, plus the same names without ``-excel``."""
++    if model == 'gpt-6-sol':
++        return excel_upstream.excel_model_id('gpt-6-excel')
+     if excel_upstream.is_excel_model(model):
+         return excel_upstream.excel_model_id(model)
+     if isinstance(model, str):
+diff --git a/src/excel_codex_bridge/sub2api.py b/src/excel_codex_bridge/sub2api.py
+index 480cb0c..2fee427 100644
+--- a/src/excel_codex_bridge/sub2api.py
++++ b/src/excel_codex_bridge/sub2api.py
+@@ -26,6 +26,7 @@ from .session import SessionReader
+ 
+ SESSION_PATH = "/admin/session"
+ MAX_SESSION_BYTES = 64 * 1024
++POOL_PATH = "/internal/v1/responses"
+ API_PATHS = {"/v1/models", "/models", "/v1/responses", "/responses"}
+ 
+ 
+@@ -85,8 +86,9 @@ def session_summary(reader: SessionReader) -> dict:
+ 
+ 
+ class GatewayGuard:
+-    def __init__(self, app, keys: GatewayKeys):
++    def __init__(self, app, keys: GatewayKeys, transport_key=None):
+         self.app, self.keys = app, keys
++        self.transport_key = transport_key
+ 
+     async def __call__(self, scope, receive, send):
+         if scope["type"] == "lifespan":
+@@ -102,7 +104,7 @@ class GatewayGuard:
+             error = sse.openai_error_response(403, "Browser-originated requests are not accepted")
+         elif path == "/healthz" and scope["method"] == "GET":
+             pass
+-        elif path in API_PATHS or path == SESSION_PATH:
++        elif path in API_PATHS or path == SESSION_PATH or (path == POOL_PATH and self.transport_key):
+             admin = path == SESSION_PATH
+             peer = (scope.get("client") or ("", 0))[0]
+             try:
+@@ -114,11 +116,11 @@ class GatewayGuard:
+             else:
+                 values = [v for k, v in headers if k.lower() == b"authorization"]
+                 parts = values[0].split(b" ", 1) if len(values) == 1 else []
+-                key = self.keys.admin if admin else self.keys.api
++                key = self.transport_key if path == POOL_PATH else (self.keys.admin if admin else self.keys.api)
+                 if (len(parts) != 2 or parts[0].lower() != b"bearer"
+                         or not hmac.compare_digest(parts[1], key.encode("ascii"))):
+                     error = sse.openai_error_response(
+-                        401, "Invalid API key", headers={"www-authenticate": "Bearer"}
++                        401, "Invalid API key", headers={"www-authenticate": "Bearer", **({"x-sub2-excel-failure": "transport"} if path == POOL_PATH else {})}
+                     )
+         else:
+             error = sse.openai_error_response(404, "Not found")
+@@ -173,8 +175,14 @@ async def read_json(request: Request, limit: int) -> dict:
+     return decode_json(bytes(raw), request.headers.get("content-encoding", ""), limit)
+ 
+ 
+-def create_app(keys: GatewayKeys, *, client_factory=build_upstream_client):
++def create_app(keys: GatewayKeys, *, client_factory=build_upstream_client, transport_key=None):
+     reader = PushedSessionReader()
++    if transport_key is None and (os.getenv('EXCEL_SUB2API_TRANSPORT_KEY') or os.getenv('EXCEL_SUB2API_TRANSPORT_KEY_FILE')):
++        transport_key = read_secret('EXCEL_SUB2API_TRANSPORT_KEY')
++    if transport_key is not None:
++        GatewayKeys(transport_key, keys.admin)
++        if hmac.compare_digest(transport_key, keys.api):
++            raise ValueError('Transport and API keys must differ')
+     bridge = Bridge(reader, client_factory)
+ 
+     @contextlib.asynccontextmanager
+@@ -246,4 +254,7 @@ def create_app(keys: GatewayKeys, *, client_factory=build_upstream_client):
+         bridge.pictures = images.Pictures()
+         return session_summary(reader)
+ 
+-    return GatewayGuard(app, keys)
++    if transport_key:
++        from .pool_transport import attach_pool_route
++        attach_pool_route(app, client_factory=client_factory)
++    return GatewayGuard(app, keys, transport_key)
+diff --git a/tests/test_excel_upstream.py b/tests/test_excel_upstream.py
+index bb943c0..ef6f413 100644
+--- a/tests/test_excel_upstream.py
++++ b/tests/test_excel_upstream.py
+@@ -143,6 +143,8 @@ class ExcelUpstreamTests(unittest.TestCase):
+             "gpt-5.6-luna-excel": "gpt-5.6-luna",
+             "gpt-5.6-terra-excel": "gpt-5.6-terra",
+             "gpt-5.6-sol-excel": "gpt-5.6-sol",
++            "gpt-6-astra-excel": "gpt-6-astra",
++            "gpt-6-excel": "gpt-6-sol",
+         }
+         for requested, upstream in expected.items():
+             with self.subTest(requested=requested):
+@@ -1658,6 +1660,7 @@ class ExcelUpstreamTests(unittest.TestCase):
+                 "gpt-5.6-terra-excel",
+                 "gpt-5.6-sol-excel",
+                 "gpt-6-astra-excel",
++                "gpt-6-excel",
+             ],
+         )
+ 
+diff --git a/src/excel_codex_bridge/pool_transport.py b/src/excel_codex_bridge/pool_transport.py
+new file mode 100644
+index 0000000..0d051f0
+--- /dev/null
++++ b/src/excel_codex_bridge/pool_transport.py
+@@ -0,0 +1,137 @@
++import hashlib
++import json
++import re
++import zlib
++from urllib.parse import urlsplit
++import httpx
++from fastapi import Request
++from starlette.responses import Response, StreamingResponse, JSONResponse
++from . import sse, excel_upstream
++from .server import Bridge, MAX_BODY_BYTES, build_upstream_client
++from .sub2api import BodyTooLarge, POOL_PATH, PushedSessionReader, read_json
++
++class RequestSessionReader(PushedSessionReader):
++    def fall_back(self, refused):
++        return False
++
++class ScopedResponse(Response):
++    def __init__(self, response, bridge):
++        self.response, self.bridge = response, bridge
++        self.status_code = response.status_code
++        self.raw_headers = response.raw_headers
++        self.background = None
++
++    async def __call__(self, scope, receive, send):
++        scope_token = excel_upstream.native_call_scope.set(self.bridge.replay_scope)
++        try:
++            await self.response(scope, receive, send)
++        finally:
++            try:
++                await self.bridge.aclose()
++            finally:
++                self.bridge.reader.store.clear()
++                excel_upstream.native_call_scope.reset(scope_token)
++
++class RequestBridge(Bridge):
++    def __init__(self, reader, factory, model, namespace):
++        super().__init__(reader, factory)
++        self.response_model = model
++        self.replay_scope = namespace
++
++    async def _stream(self, headers, upstream_body, source_body):
++        response = await super()._stream(headers, upstream_body, source_body)
++        if not isinstance(response, StreamingResponse):
++            return response
++        original = response.body_iterator
++        async def restore_model():
++            async for event, data in sse.iter_sse_messages(original):
++                if data is None:
++                    continue
++                try:
++                    payload = json.loads(data)
++                except (ValueError, TypeError):
++                    yield ('data: ' + data + chr(10) * 2).encode()
++                    continue
++                if isinstance(payload, dict):
++                    if isinstance(payload.get('response'), dict):
++                        payload['response']['model'] = self.response_model
++                    elif 'model' in payload:
++                        payload['model'] = self.response_model
++                if event:
++                    yield sse.sse_encode(event, payload)
++                else:
++                    yield ('data: ' + json.dumps(payload, ensure_ascii=False) + chr(10) * 2).encode()
++        response.body_iterator = restore_model()
++        return response
++
++    async def _non_stream(self, headers, upstream_body, source_body):
++        response = await super()._non_stream(headers, upstream_body, source_body)
++        if response.status_code < 400:
++            payload = json.loads(response.body)
++            payload['model'] = self.response_model
++            return JSONResponse(payload, status_code=response.status_code)
++        return response
++
++
++def identity_header(request, name, required=True):
++    values = request.headers.getlist(name)
++    if not values and not required:
++        return ''
++    if len(values) != 1 or not values[0] or len(values[0]) > 32768:
++        raise ValueError('Invalid identity')
++    if any(ord(c) < 33 or ord(c) > 126 for c in values[0]):
++        raise ValueError('Invalid identity')
++    return values[0]
++
++
++def attach_pool_route(app, client_factory=build_upstream_client):
++    @app.post(POOL_PATH)
++    async def pool_responses(request: Request):
++        reader = RequestSessionReader()
++        bridge = None
++        try:
++            token = identity_header(request, 'x-sub2-excel-access-token')
++            account = identity_header(request, 'x-sub2-excel-account-id')
++            namespace = identity_header(request, 'x-sub2-excel-scope')
++            if not re.fullmatch(r'[0-9a-f]{64}', namespace):
++                raise ValueError('Invalid scope')
++            headers = {'authorization': 'Bearer ' + token, 'chatgpt-account-id': account, 'x-openai-account-id': account}
++            user = identity_header(request, 'x-sub2-excel-account-user-id', False)
++            if user:
++                headers['x-openai-account-user-id'] = user
++            reader.store.configure(headers, persist=False, allow_expired=False)
++            proxy = identity_header(request, 'x-sub2-excel-proxy', False)
++            if proxy and (urlsplit(proxy).scheme not in {'http', 'https', 'socks5', 'socks5h'} or not urlsplit(proxy).hostname):
++                raise ValueError('Invalid proxy')
++            body = await read_json(request, MAX_BODY_BYTES)
++            if 'stream' in body and not isinstance(body['stream'], bool):
++                raise ValueError('Invalid stream flag')
++            hint = body.get('prompt_cache_key') or body.get('session_id')
++            if hint is None:
++                hint = json.dumps(body.get('input'), ensure_ascii=True, sort_keys=True)
++            body['prompt_cache_key'] = hashlib.sha256((namespace + ':' + str(hint)).encode()).hexdigest()
++            factory = client_factory
++            if proxy or client_factory is build_upstream_client:
++                factory = lambda: httpx.AsyncClient(proxy=proxy or None, trust_env=False, verify=True, timeout=httpx.Timeout(connect=30, read=600, write=60, pool=30))
++            bridge = RequestBridge(reader, factory, body.get('model'), namespace)
++            scope_token = excel_upstream.native_call_scope.set(namespace)
++            try:
++                response = await bridge.responses(body)
++            finally:
++                excel_upstream.native_call_scope.reset(scope_token)
++            return ScopedResponse(response, bridge)
++        except BodyTooLarge:
++            if bridge:
++                await bridge.aclose()
++            reader.store.clear()
++            return sse.openai_error_response(413, 'Request body is too large')
++        except (ValueError, zlib.error, RecursionError):
++            if bridge:
++                await bridge.aclose()
++            reader.store.clear()
++            return sse.openai_error_response(400, 'Invalid selected-account identity or request')
++        except BaseException:
++            if bridge:
++                await bridge.aclose()
++            reader.store.clear()
++            raise
+diff --git a/tests/test_gpt6_excel.py b/tests/test_gpt6_excel.py
+new file mode 100644
+index 0000000..8c1d74b
+--- /dev/null
++++ b/tests/test_gpt6_excel.py
+@@ -0,0 +1,48 @@
++import unittest
++from excel_codex_bridge import excel_upstream
++from test_server import BridgeHarness, ok_stream
++
++class Gpt6ExcelTests(unittest.TestCase):
++    def test_old_and_new_routes_remain_explicit(self):
++        expected = {
++            "gpt-5.6-luna-excel": "gpt-5.6-luna",
++            "gpt-5.6-terra-excel": "gpt-5.6-terra",
++            "gpt-5.6-sol-excel": "gpt-5.6-sol",
++            "gpt-6-astra-excel": "gpt-6-astra",
++            "gpt-6-excel": "gpt-6-sol",
++        }
++        self.assertEqual(excel_upstream.EXCEL_MODEL_UPSTREAMS, expected)
++        self.assertEqual(excel_upstream.MODEL_ID, "gpt-5.6-sol-excel")
++        for alias, upstream in expected.items():
++            with self.subTest(alias=alias):
++                body = excel_upstream.prepare_responses_body({"model": alias, "input": "ping"})
++                self.assertEqual(body["model"], upstream)
++                self.assertEqual(body["model_selection"], "explicit")
++                self.assertFalse(body["store"])
++
++    def test_stream_and_non_stream(self):
++        for stream in (False, True):
++            with self.subTest(stream=stream):
++                harness = BridgeHarness(ok_stream)
++                response = harness.request("POST", "/v1/responses", json={
++                    "model": "gpt-6-excel", "input": "ping", "stream": stream})
++                self.assertEqual(response.status_code, 200)
++                self.assertEqual(harness.upstream_json()["model"], "gpt-6-sol")
++                self.assertEqual(harness.upstream_json()["stream"], stream)
++                if not stream:
++                    self.assertEqual(response.json()["model"], "gpt-6-excel")
++
++    def test_catalog_keeps_old_models_and_appends_new(self):
++        response = BridgeHarness(ok_stream).request("GET", "/v1/models")
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual([x["id"] for x in response.json()["data"]], [
++            "gpt-5.6-luna-excel", "gpt-5.6-terra-excel",
++            "gpt-5.6-sol-excel", "gpt-6-astra-excel", "gpt-6-excel"])
++
++    def test_unknown_model_still_rejected(self):
++        harness = BridgeHarness(ok_stream)
++        response = harness.request("POST", "/v1/responses", json={
++            "model": "gpt-not-a-real-excel-model", "input": "ping"})
++        self.assertEqual(response.status_code, 400)
++        self.assertEqual(response.json()["error"]["code"], "model_not_found")
++        self.assertEqual(harness.upstream_requests, [])
+diff --git a/tests/test_pool_transport.py b/tests/test_pool_transport.py
+new file mode 100644
+index 0000000..329e829
+--- /dev/null
++++ b/tests/test_pool_transport.py
+@@ -0,0 +1,124 @@
++import asyncio
++import json
++import time
++import httpx
++import pytest
++from helpers import session_headers
++from test_server import text_stream
++from excel_codex_bridge import sub2api, excel_upstream, pool_transport
++
++API = 'public-' + 'a' * 40
++ADMIN = 'admin-' + 'b' * 40
++TRANSPORT = 'transport-' + 'c' * 40
++
++def identity(account='account-a', scope='a' * 64, exp=None):
++    token = session_headers(exp=exp)['authorization'].split(' ', 1)[1]
++    return {'authorization': 'Bearer ' + TRANSPORT, 'x-sub2-excel-access-token': token,
++            'x-sub2-excel-account-id': account, 'x-sub2-excel-scope': scope}
++
++def app_for(handler):
++    return sub2api.create_app(sub2api.GatewayKeys(API, ADMIN), transport_key=TRANSPORT,
++        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
++
++def call(app, headers=None, **body):
++    async def run():
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://sidecar') as client:
++            return await client.post(sub2api.POOL_PATH, headers=headers or identity(), json=body or {'model': 'gpt-6-sol', 'input': 'hi'})
++    return asyncio.run(run())
++
++@pytest.mark.parametrize('key', [API, ADMIN, 'invalid', ''])
++def test_private_endpoint_rejects_other_keys(key):
++    def upstream(request):
++        pytest.fail('must not call upstream')
++    headers=identity();headers['authorization']='Bearer '+key
++    assert call(app_for(upstream),headers).status_code == 401
++
++@pytest.mark.parametrize('field,value', [('x-sub2-excel-access-token',''),('x-sub2-excel-account-id',''),('x-sub2-excel-scope','bad')])
++def test_invalid_identity_never_falls_back(field,value):
++    def upstream(request):
++        pytest.fail('must not call upstream')
++    app=app_for(upstream)
++    app.app.state.bridge.reader.store.configure(session_headers(account='global-session'), persist=False)
++    headers=identity();headers[field]=value
++    assert call(app,headers).status_code == 400
++
++def test_duplicate_identity_rejected():
++    headers=list(identity().items())+[('x-sub2-excel-account-id','another')]
++    assert call(app_for(lambda r: pytest.fail('no upstream')),headers).status_code == 400
++
++def test_expired_identity_rejected():
++    assert call(app_for(lambda r: pytest.fail('no upstream')),identity(exp=time.time()-60)).status_code == 400
++
++@pytest.mark.parametrize('model',['gpt-6-sol','gpt-6-astra','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna'])
++@pytest.mark.parametrize('stream',[False,True])
++def test_concurrent_identity_and_output_models(model,stream,monkeypatch):
++    requests=[];bridges=[]
++    original=pool_transport.RequestBridge.__init__
++    def track(self,*args):
++        original(self,*args);bridges.append(self)
++    monkeypatch.setattr(pool_transport.RequestBridge,'__init__',track)
++    async def upstream(request):
++        await asyncio.sleep(0.002)
++        requests.append((dict(request.headers),json.loads(request.content)))
++        return httpx.Response(200,headers={'content-type':'text/event-stream'},content=text_stream('OK'))
++    app=app_for(upstream)
++    async def run():
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://sidecar') as client:
++            return await asyncio.gather(*[client.post(sub2api.POOL_PATH,headers=identity('account-'+str(i),format(i,'064x')),
++                json={'model':model,'input':'hi','stream':stream,'prompt_cache_key':'same-session'}) for i in range(8)])
++    results=asyncio.run(run())
++    assert all(r.status_code==200 for r in results)
++    assert all(model in r.text for r in results)
++    assert {h['chatgpt-account-id'] for h,b in requests} == {'account-'+str(i) for i in range(8)}
++    assert len({b['prompt_cache_key'] for h,b in requests})==8
++    assert all(not any(k.startswith('x-sub2-excel') for k in h) for h,b in requests)
++    assert all(not b.reader.store.status()['configured'] for b in bridges)
++    assert not app.app.state.bridge.reader.store.status()['configured']
++
++def test_private_tool_replay_is_namespaced(monkeypatch,tmp_path):
++    monkeypatch.setattr(excel_upstream,'_native_call_store_path',None)
++    excel_upstream._native_call_cache.clear()
++    item={'call_id':'same-call','type':'function_call','name':'run_officejs','arguments':'account-a-private'}
++    token=excel_upstream.native_call_scope.set('group-a')
++    try:
++        excel_upstream._remember_native_call(item)
++        assert excel_upstream._remembered_native_call('same-call')==item
++        excel_upstream.native_call_scope.set('group-b')
++        assert excel_upstream._remembered_native_call('same-call') is None
++        excel_upstream.native_call_scope.set('')
++        assert excel_upstream._remembered_native_call('same-call') is None
++    finally:
++        excel_upstream.native_call_scope.reset(token)
++        excel_upstream._native_call_cache.clear()
++
++def test_upstream_auth_failure_does_not_try_global_session():
++    requests=[]
++    def upstream(request):
++        requests.append(request)
++        return httpx.Response(401,json={'error':{'message':'expired upstream session'}})
++    app=app_for(upstream);app.app.state.bridge.reader.store.configure(session_headers(account='global'),persist=False)
++    assert call(app).status_code==401
++    assert len(requests)==1
++    assert requests[0].headers['chatgpt-account-id']=='account-a'
++
++def test_private_endpoint_disabled_without_transport_key():
++    app=sub2api.create_app(sub2api.GatewayKeys(API,ADMIN))
++    assert call(app).status_code==404
++
++def test_private_default_client_ignores_global_proxy(monkeypatch):
++    captured = []
++    real_client = httpx.AsyncClient
++    def upstream(request):
++        return httpx.Response(200, headers={'content-type': 'text/event-stream'}, content=text_stream('OK'))
++    def client(**kwargs):
++        captured.append(kwargs)
++        return real_client(transport=httpx.MockTransport(upstream))
++    monkeypatch.setenv('EXCEL_BRIDGE_PROXY', 'http://wrong-proxy:8080')
++    app = sub2api.create_app(sub2api.GatewayKeys(API, ADMIN), transport_key=TRANSPORT)
++    async def run():
++        async with real_client(transport=httpx.ASGITransport(app=app), base_url='http://sidecar') as caller:
++            monkeypatch.setattr(pool_transport.httpx, 'AsyncClient', client)
++            return await caller.post(sub2api.POOL_PATH, headers=identity(), json={'model': 'gpt-6-sol', 'input': 'hi'})
++    assert asyncio.run(run()).status_code == 200
++    assert captured and captured[0]['proxy'] is None
++    assert captured[0]['trust_env'] is False
